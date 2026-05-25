@@ -276,9 +276,9 @@
                 const today = new Date();
                 
                 // --- 步驟 1: 預報與觀測資料 ---
-                // F-C0032-001 (36小時預報) 仍用於 MinT, MaxT, PoP
-                const forecastUrl = `https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001?Authorization=${BDF}&locationName=${encodeURIComponent(apiCityName)}`;
-                // ✨ 修正點：切換為 O-A0001-001 (全測站逐時氣象資料)，並指定需要的資料欄位
+                // F-D0047-091 (臺灣各縣市1週天氣預報) 用於 MinT, MaxT, PoP12h, Wx
+                const forecastUrl = `https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-D0047-091?Authorization=${BDF}&locationName=${encodeURIComponent(apiCityName)}`;
+                // O-A0001-001 (全測站逐時氣象資料)
                 const observationUrl = `https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization=${BDF}&elementName=TEMP,HUMD,WIND_SPEED,VISB,WEATHER`;
 
                 const [forecastRes, observationRes] = await Promise.all([
@@ -289,20 +289,18 @@
                 if (!forecastRes.ok) throw new Error("Forecast API failed");
                 const forecastData = await forecastRes.json();
                 
-                const locationData = forecastData.records.location[0];
+                const locationData = forecastData.records.locations[0].location[0];
                 const weatherElements = locationData.weatherElement;
-                const getElement = (name) => weatherElements.find(el => el.elementName === name)?.time[0]?.parameter;
-				const firstForecastSlot = weatherElements?.find(el => el.time && el.time.length)?.time?.[0];
-				const rawForecastSlotTime = firstForecastSlot?.startTime || firstForecastSlot?.dataTime || firstForecastSlot?.endTime || null;
-				const fallbackForecastTime = rawForecastSlotTime ? formatToTaipeiTime(rawForecastSlotTime) : null;
-				
-				// 時間 1: 預報資料發布時間
-				
-				const forecastUpdateTime = formatToTaipeiTime(forecastData.records.datasetPublishTime);	
-                const wx = getElement("Wx");
-                const pop = getElement("PoP");
-                const minT = getElement("MinT"); 
-                const maxT = getElement("MaxT"); 
+                
+                const getElement = (name) => weatherElements.find(el => el.elementName === name);
+                
+                const wxEl = getElement("Wx");
+                const popEl = getElement("PoP12h");
+                const minTEl = getElement("MinT"); 
+                const maxTEl = getElement("MaxT"); 
+                const rhEl = getElement("RH");
+                const wsEl = getElement("WS");
+                const uviEl = getElement("UVI");
 
                 // --- 步驟 2: 處理觀測資料 (即時溫度、濕度等) ---
                 let obsData = null;
@@ -312,118 +310,127 @@
                     const obsJson = await observationRes.json();
                     const stations = obsJson.records.Station;
                     
-                    const targetCounty = apiCityName; // e.g. 臺北市
+                    const targetCounty = apiCityName;
+                    const targetTown = district;
                     
-                    // 【步驟 1: 優先尋找該縣市內，第一個有觀測時間的站點】
-                    let stationWithTime = stations.find(s => 
-                        s.CountyName === targetCounty && s.ObsTime?.DateTime
+                    // 【優先尋找該行政區內的站點】
+                    let matchStation = stations.find(s => 
+                        s.GeoInfo?.CountyName === targetCounty && s.GeoInfo?.TownName === targetTown && s.WeatherElement?.TEMP !== undefined
                     );
                     
-                    // O-A0001-001 站點結構不同，以 CountyName 篩選並取第一筆 (用於數據)
-                    const matchStation = stations.find(s => 
-                        s.CountyName === targetCounty
-                    );
-                    
-                    // 【步驟 2: 如果找到了有時間的站點，就取用它的時間】
-                    if (stationWithTime) {
-                        updateTime = formatToTaipeiTime(stationWithTime.ObsTime.DateTime);
-                    } else {
-						const anyStationWithTime = stations.find(s => s.ObsTime?.DateTime);
-						if (anyStationWithTime) {
-							updateTime = formatToTaipeiTime(anyStationWithTime.ObsTime.DateTime);
-						}
+                    // 【找不到則找該縣市內任一有資料的站點】
+                    if (!matchStation) {
+                        matchStation = stations.find(s => 
+                            s.GeoInfo?.CountyName === targetCounty && s.WeatherElement?.TEMP !== undefined
+                        );
                     }
                     
-                    // 【步驟 3: 接著，從第一個找到的 matchStation 取觀測數據】
-                    if (matchStation && matchStation.WeatherElement) {
+                    if (matchStation) {
+                        updateTime = formatToTaipeiTime(matchStation.ObsTime?.DateTime);
                         const w = matchStation.WeatherElement;
-                        // O-A0001-001 鍵名調整：TEMP, HUMD, WIND_SPEED, VISB
                         const val = (v) => (v === -99 || v === "-99" || v === null || v === "null") ? null : parseFloat(v);
                         
                         obsData = {
-                           // ... (省略：數據解析邏輯) ...
+                            temp: val(w.TEMP),
+                            humidity: val(w.HUMD) ? val(w.HUMD) * 100 : null,
+                            windSpeed: val(w.WIND_SPEED) || val(w.WDSD),
+                            visibility: val(w.VISB) || val(w.VIS),
+                            weather: w.WEATHER || w.Weather
                         };
-                        
-                        // 注意：這裡不再嘗試從 matchStation 獲取 updateTime，因為已在步驟 2 處理
                     }
-
                 }
                 
-                // --- 步驟 3: 處理日出日落 (使用略為準確的模擬值) ---
+                // --- 步驟 3: 處理日出日落 ---
                 const { sunrise, sunset } = getAstronomicalData(city); 
                 
-                // --- 步驟 4: 整合數據與補償 ---
-                const rainProb = parseInt(pop?.parameterName ?? 10);
-                const isRaining = rainProb > 50 || (wx?.parameterName.includes("雨") ?? false);
+                // --- 步驟 4: 整合數據 ---
+                // 取預報的第一個時段資料
+                const rainProb = parseInt(popEl?.time[0]?.elementValue[0]?.value ?? 10);
+                const description = obsData?.weather || wxEl?.time[0]?.elementValue[0]?.value || "多雲";
+                const isRaining = rainProb > 50 || description.includes("雨");
                 
-                const currentTemp = obsData?.temp ?? Math.round((parseInt(minT?.parameterName ?? 20) + parseInt(maxT?.parameterName ?? 25)) / 2);
-                const humidity = obsData?.humidity ?? (isRaining ? 85 : 60); // HUMD 已在上方轉為百分比
-                const windSpeed = obsData?.windSpeed ?? (isRaining ? 4 : 2);
-                const description = obsData?.weather && obsData.weather !== "-99" ? obsData.weather : (wx?.parameterName ?? "多雲");
+                const currentTemp = obsData?.temp ?? parseInt(maxTEl?.time[0]?.elementValue[0]?.value ?? 25);
+                
+                // 找出今日的最高與最低溫 (通常在預報的前兩個 12 小時時段內)
+                const highT = Math.max(
+                    parseInt(maxTEl?.time[0]?.elementValue[0]?.value ?? 25),
+                    parseInt(maxTEl?.time[1]?.elementValue[0]?.value ?? 25)
+                );
+                const lowT = Math.min(
+                    parseInt(minTEl?.time[0]?.elementValue[0]?.value ?? 20),
+                    parseInt(minTEl?.time[1]?.elementValue[0]?.value ?? 20)
+                );
 
                 let conditionIcon = "Sunny";
                 if (description.includes("雨")) conditionIcon = "Rain";
                 else if (description.includes("雲") || description.includes("陰")) conditionIcon = "Cloudy";
 
-                // AQI, UV, Visibility: 觀測 API 可能無資料，進行模擬補償
-                // O-A0001-001 無 UV，仍使用補償/模擬
-                const uv = (obsData?.uv && obsData.uv !== -99) ? obsData.uv : (isRaining ? 2 : 6); 
+                const uv = obsData?.uv ?? parseInt(uviEl?.time[0]?.elementValue[0]?.value ?? 4);
                 const aqi = isRaining ? 35 : 65; 
-                const visibility = (obsData?.visibility && obsData.visibility !== -99) ? obsData.visibility : (isRaining ? 5 : 20);
+                const visibility = obsData?.visibility ?? (isRaining ? 5 : 20);
 
-                const aiSummary = generateAISummary(currentTemp, description.includes("雨"), uv, windSpeed, aqi, visibility);
+                const aiSummary = generateAISummary(currentTemp, isRaining, uv, obsData?.windSpeed || 2, aqi, visibility);
 
-                const finalUpdateTime = updateTime || forecastUpdateTime || fallbackForecastTime;
+                // 建立 7 天預報
+                const daily = [];
+                // F-D0047-091 每 12 小時一筆，共 14 筆代表 7 天
+                for (let i = 0; i < 14; i += 2) {
+                    const t = wxEl.time[i];
+                    if (!t) break;
+                    const d = new Date(t.startTime);
+                    daily.push({
+                        date: `${d.getMonth() + 1}/${d.getDate()}`,
+                        day: DAYS[d.getDay()],
+                        high: parseInt(maxTEl.time[i]?.elementValue[0]?.value || maxTEl.time[i+1]?.elementValue[0]?.value || 25),
+                        low: parseInt(minTEl.time[i+1]?.elementValue[0]?.value || minTEl.time[i]?.elementValue[0]?.value || 20),
+                        icon: (wxEl.time[i].elementValue[0].value.includes("雨")) ? "Rain" : (wxEl.time[i].elementValue[0].value.includes("雲") || wxEl.time[i].elementValue[0].value.includes("陰") ? "Cloudy" : "Sunny"),
+                        rainProb: parseInt(popEl.time[i]?.elementValue[0]?.value || popEl.time[i+1]?.elementValue[0]?.value || 0)
+                    });
+                }
+
+                // 建立模擬的 24 小時逐時預報 (以 12 小時預報為基準進行平滑)
+                const hourly = Array.from({ length: 24 }, (_, i) => {
+                    const now = new Date();
+                    now.setHours(now.getHours() + i);
+                    const hour = now.getHours();
+                    const isNewDay = i > 0 && hour === 0;
+                    
+                    // 簡單的溫度曲線模擬：中午最高，凌晨最低
+                    const timeFactor = Math.cos((hour - 14) * Math.PI / 12); // 14:00 為 1, 02:00 為 -1
+                    const predictedTemp = Math.round(lowT + (highT - lowT) * (timeFactor + 1) / 2);
+
+                    return {
+                        time: `${String(hour).padStart(2, '0')}:00`,
+                        isNewDay: isNewDay,
+                        temp: predictedTemp,
+                        icon: conditionIcon,
+                        rainProb: rainProb
+                    };
+                });
 
                 return {
                     isMock: false,
-					// ✨ 修正點：使用觀測 > 預報發布 > 預報時段三層備援
-					updateTime: finalUpdateTime,
+					updateTime: updateTime || formatToTaipeiTime(forecastData.records.datasetPublishTime),
                     current: {
                         dateStr: `${today.getMonth() + 1}/${today.getDate()}`,
-                        dayStr: DAYS[today.getDay()], // ✨ 修正點：使用 DAYS 陣列獲取星期幾
+                        dayStr: DAYS[today.getDay()],
                         temp: currentTemp,
-                        // High/Low 仍使用預報 F-C0032-001 的數據
-                        high: parseInt(maxT?.parameterName ?? 25), 
-                        low: parseInt(minT?.parameterName ?? 20),
+                        high: highT, 
+                        low: lowT,
                         condition: conditionIcon,
                         rainProb: rainProb,
                         aqi: aqi,
-                        humidity: humidity,
-                        windSpeed: windSpeed,
+                        humidity: obsData?.humidity ?? parseInt(rhEl?.time[0]?.elementValue[0]?.value ?? 70),
+                        windSpeed: obsData?.windSpeed ?? parseInt(wsEl?.time[0]?.elementValue[0]?.value ?? 2),
                         uv: uv,
                         visibility: `${visibility}km`,
-                        sunrise: sunrise, // 使用略為準確的模擬值
-                        sunset: sunset,   // 使用略為準確的模擬值
+                        sunrise: sunrise,
+                        sunset: sunset,
                         description: description,
                         aiSummary: aiSummary
                     },
-                    hourly: Array.from({ length: 24 }, (_, i) => {
-                        const now = new Date();
-                        now.setHours(now.getHours() + i);
-                        const hour = now.getHours();
-                        const isNewDay = i > 0 && hour === 0;
-                        return {
-                            time: `${String(hour).padStart(2, '0')}:00`,
-                            isNewDay: isNewDay,
-                            temp: currentTemp + Math.floor(Math.random() * 3 - 1), 
-                            icon: conditionIcon,
-                            rainProb: rainProb
-                        };
-                    }),
-                    daily: Array.from({ length: 7 }, (_, i) => {
-                        const date = new Date();
-                        date.setDate(date.getDate() + i + 1);
-                        const dayName = DAYS[date.getDay()];
-                        return {
-                            date: `${date.getMonth() + 1}/${date.getDate()}`,
-                            day: dayName,
-                            high: parseInt(maxT?.parameterName ?? 25) + Math.floor(Math.random() * 4 - 2),
-                            low: parseInt(minT?.parameterName ?? 20) + Math.floor(Math.random() * 4 - 2),
-                            icon: conditionIcon,
-                            rainProb: Math.max(0, rainProb + Math.floor(Math.random() * 20 - 10))
-                        };
-                    })
+                    hourly: hourly,
+                    daily: daily
                 };
 
             } catch (error) {
